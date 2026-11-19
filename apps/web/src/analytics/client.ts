@@ -3,6 +3,7 @@
 // builds and forks impose zero runtime cost. All entry points are
 // fire-and-forget: capture failures must never propagate to product code.
 
+import { getOpenDesignHost } from '@open-design/host';
 import type { PostHog } from 'posthog-js';
 import {
   EVENT_SCHEMA_VERSION,
@@ -13,9 +14,12 @@ import {
 import { scrubBeforeSend } from './scrub';
 import {
   clearExceptionTrackingContext,
+  detectBrowserOsName,
   setExceptionTrackingContext,
+  patchInputAggregationTrial,
 } from './error-tracking';
 import { pinFirstSessionForCapture } from './identity';
+import { registerChatReplaySessionSource } from '../observability/chat-context';
 import { coalescedGet } from '../lib/coalesced-get';
 
 interface AnalyticsContext {
@@ -203,6 +207,21 @@ function fetchAnalyticsConfigShared(): Promise<AnalyticsConfigResponse | null> {
 }
 
 let exceptionBootstrapPromise: Promise<void> | null = null;
+let inputTrialConfigTimer: ReturnType<typeof setInterval> | null = null;
+function watchInputTrialConfig(cfg: AnalyticsConfigResponse): void {
+  // No extra polling for ordinary clients. Missing config on an opted-in client pauses summaries.
+  if (!cfg.inputAggregation || inputTrialConfigTimer) return;
+  let refreshing = false;
+  inputTrialConfigTimer = setInterval(() => {
+    if (refreshing) return;
+    refreshing = true;
+    void fetch('/api/analytics/config', { signal: AbortSignal.timeout(5000), cache: 'no-store' })
+      .then(async res => res.ok ? await res.json() as AnalyticsConfigResponse : null).then(next => {
+      const sameTarget = next?.key === cfg.key && next?.host === cfg.host && next?.installationId === cfg.installationId;
+      patchInputAggregationTrial(sameTarget ? next?.inputAggregation : null);
+    }).catch(() => patchInputAggregationTrial(null)).finally(() => { refreshing = false; });
+  }, 30_000);
+}
 export function bootstrapExceptionTracking(context: AnalyticsContext): Promise<void> {
   if (exceptionBootstrapPromise) return exceptionBootstrapPromise;
   exceptionBootstrapPromise = (async () => {
@@ -217,17 +236,25 @@ export function bootstrapExceptionTracking(context: AnalyticsContext): Promise<v
         return;
       }
       const telemetryEnv = cfg.env || 'unknown';
-      const distinctId =
-        (typeof cfg.installationId === 'string' && cfg.installationId) ||
-        context.anonymousId;
+      const installationId = typeof cfg.installationId === 'string' && cfg.installationId ? cfg.installationId : null;
+      const distinctId = installationId || context.anonymousId;
+      const hostStartupContext = await getOpenDesignHost()?.startup?.context().catch(() => null);
       setExceptionTrackingContext({
+        // Fresh install that has not opted out: the renderer mints the
+        // installation id shortly after; hold stability metrics until then.
+        identityPending: installationId == null && cfg.enabled === true,
         apiKey: cfg.key,
         host: cfg.host,
         distinctId,
+        clientType: context.clientType,
+        osName: detectBrowserOsName(),
         appVersion: context.appVersion,
         sessionId: context.sessionId,
+        ...(hostStartupContext ? { appSessionId: hostStartupContext.app_session_id } : {}),
         telemetryEnv,
+        inputAggregation: cfg.inputAggregation ?? null,
       });
+      watchInputTrialConfig(cfg);
     } catch {
       // Network failure / endpoint unavailable — leave the buffer in
       // place so a future retry could still flush, but don't crash boot.
@@ -353,6 +380,15 @@ export async function getAnalyticsClient(
         },
 
         loaded: (instance) => {
+          // Hand the chat-observability correlation block its replay-session
+          // reader. This is the ONLY place it can come from: we load
+          // posthog-js through `await import('posthog-js')`, and the ESM
+          // build — unlike the landing page's `array.js` snippet — never
+          // publishes itself as `window.posthog`. Without this line every
+          // `replay_session_id` on a `client_chat_*` event is silently
+          // undefined while the wiring looks complete. See the trap
+          // documented on `registerChatReplaySessionSource`.
+          registerChatReplaySessionSource(() => instance.get_session_id());
           lastRegisterPayload = {
             event_schema_version: EVENT_SCHEMA_VERSION,
             env: telemetryEnv,
@@ -384,10 +420,16 @@ export async function getAnalyticsClient(
             apiKey: cfgKey,
             host: cfgHost,
             distinctId,
+            // Re-bridging must not end the first-session hold (OPEND-4220).
+            identityPending: !(typeof cfg.installationId === 'string' && cfg.installationId) && cfg.enabled === true,
+            clientType: context.clientType,
+            osName: detectBrowserOsName(),
             appVersion: context.appVersion,
             sessionId: context.sessionId,
             telemetryEnv,
+            inputAggregation: cfg.inputAggregation ?? null,
           });
+          watchInputTrialConfig(cfg);
         },
       });
       client = posthog;
@@ -409,12 +451,32 @@ export async function getAnalyticsClient(
     }
   })();
   initPromise = pending;
-  // Clear the cache as soon as the result is null so a later opt-in retries.
+  // Reopen the read only while a null answer is still PROVISIONAL — that is,
+  // until the app has told this module what the user's consent actually is.
+  //
+  // Clearing it on every null instead made each later `track()` call re-read
+  // `/api/analytics/config`, because `track` funnels through this function: on
+  // one cold conversation open that was three extra requests, and it is the
+  // steady state for every session where analytics is off (a user who declined
+  // the privacy toggle, and every dev build, where the daemon answers
+  // `enabled:false, key:null`).
+  //
+  // Nothing that could change the answer is lost: `applyConsent(true)` is the
+  // opt-in event, it runs before the provider re-calls this function, and it
+  // reopens the read itself. See `applyConsent`.
   void pending.then((result) => {
-    if (!result) initPromise = null;
+    if (!result && !consentDecisionApplied) initPromise = null;
   });
   return pending;
 }
+
+// Whether the app has told this module what the user's consent is yet, and
+// what it last said. Before the first decision arrives a null init is
+// provisional (boot ordering: the provider's mount effect calls
+// `getAnalyticsClient` before `App`'s effect calls `setConsent`); after it,
+// only a fresh GRANT can change the daemon's answer.
+let consentDecisionApplied = false;
+let lastConsentGranted = false;
 
 // Called from the AnalyticsProvider when the user toggles Privacy →
 // metrics off so events stop flowing immediately, before the next
@@ -434,6 +496,18 @@ export async function getAnalyticsClient(
 // posthog-js would still think the user is the old id and stitch the
 // new session to the deleted identity. reset() prevents that.
 export function applyConsent(consentGranted: boolean): void {
+  // A fresh GRANT is the one event that can turn a null init into a live
+  // client, so it — and only it — reopens the `/api/analytics/config` read
+  // `getAnalyticsClient` memoised. The provider calls this before it re-calls
+  // `getAnalyticsClient`, so the retry that the null-clearing used to provide
+  // still happens, once, on the event that warrants it rather than on every
+  // `track()`. A client that is already live needs no re-init; `opt_in_capturing`
+  // below is the whole of the work.
+  const newlyGranted = consentGranted && (!consentDecisionApplied || !lastConsentGranted);
+  consentDecisionApplied = true;
+  lastConsentGranted = consentGranted;
+  if (newlyGranted && !client) initPromise = null;
+
   if (!client) return;
   try {
     if (consentGranted) {

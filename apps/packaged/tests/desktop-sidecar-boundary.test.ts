@@ -1,0 +1,44 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { describe, expect, it } from "vitest";
+
+const here = dirname(fileURLToPath(import.meta.url));
+
+function source(relativePath: string): string {
+  return readFileSync(join(here, relativePath), "utf8").replace(/\r\n?/g, "\n");
+}
+
+describe("packaged desktop sidecar boundary", () => {
+  it("forwards every desktop business action", () => {
+    const packagedMain = source("../src/index.ts");
+    const desktopMain = source("../../desktop/src/main/index.ts");
+    const actions = (source: string, startAt = 0) => {
+      const handlersStart = source.indexOf("handlers: Object.fromEntries([", startAt);
+      const lifecycleStart = source.indexOf("lifecycle:", handlersStart);
+      expect(handlersStart).toBeGreaterThanOrEqual(0);
+      expect(lifecycleStart).toBeGreaterThan(handlersStart);
+      return source.slice(handlersStart, lifecycleStart).match(/SIDECAR_MESSAGES\.[A-Z_]+/g);
+    };
+
+    expect(actions(packagedMain)).toEqual(
+      actions(desktopMain, desktopMain.indexOf("if (isDirectEntry())")),
+    );
+  });
+
+  it("routes desktop auth registration through the shared desktop helper", () => {
+    // Transport failures resolving false, the startup/on-demand deadlines and
+    // the retry are pinned in apps/desktop/tests/main/register-desktop-auth.test.ts.
+    // Here we pin that the packaged entry delegates to it instead of carrying
+    // its own copy, and forwards the on-demand retry flag.
+    const main = source("../src/index.ts");
+    const registrationStart = main.indexOf("registerDesktopAuth: (secret, authOptions) =>");
+    const registrationEnd = main.indexOf("windowTitle:", registrationStart);
+    expect(registrationStart).toBeGreaterThanOrEqual(0);
+    expect(registrationEnd).toBeGreaterThan(registrationStart);
+    const registration = main.slice(registrationStart, registrationEnd);
+    expect(registration).toContain("registerDesktopAuthWithDaemon(client, secret, { ...authOptions, logger: packagedLogger })");
+    expect(main).not.toContain('"register-desktop-auth"');
+  });
+});
